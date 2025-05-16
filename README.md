@@ -1,13 +1,14 @@
 # seurat-v5-demo
 
-This workflow is aimed at demonstrating snRNA-seq analysis using Seurat v5 
-with various combinations for normalization, integration, and 
+This workflow demonstrates snRNA-seq analysis using Seurat v5,
+exploring various combinations for normalization and 
 [sketching](https://www.sciencedirect.com/science/article/pii/S2405471219301528). 
-Sketching was introduced to [Seurat v5](https://satijalab.org/seurat/) to enhance
-memory usage when analyzing large datasets.
+methods. Sketching, introduced in 
+[Seurat v5](https://satijalab.org/seurat/), improves memory efficiency
+when working with large datasets.
 
-Refer to the following repository of mine if you are interested in more 
-polished workflow:
+For a more polished workflow, please refer to the following 
+workflow created by myself:
 
 - [multiome-wf GitHub](https://github.com/NICHD-BSPC/multiome-wf)
 - [multiome-wf Documentation](https://nichd-bspc.github.io/multiome-wf/)
