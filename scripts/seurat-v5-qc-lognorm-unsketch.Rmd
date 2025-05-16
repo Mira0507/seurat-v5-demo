@@ -1,0 +1,974 @@
+---
+title: "scRNA-seq QC"
+output:
+    html_document:
+        code_folding: hide
+        toc: true
+        toc_float: true
+        toc_depth: 3
+        df_print: paged
+---
+
+```{r}
+knitr::opts_chunk$set(
+    warning=FALSE,
+    message=FALSE,
+    cache.lazy=FALSE)
+```
+
+```{r libraries}
+library(Seurat)
+library(BPCells)
+library(scDblFinder)
+library(tidyverse)
+library(patchwork)
+library(future)
+library(parallel)
+library(BiocParallel)
+library(Matrix)
+library(DT)
+library(UpSetR)
+
+source('../helpers.R')
+```
+
+```{r future_parallelization}
+
+# ------------------------------------------------------------------------------
+# Set up parallel computing
+# ------------------------------------------------------------------------------
+
+# Assign the number of cores for parallelization
+ncpus <- future::availableCores()
+
+# Adjust max memory allowed
+options(future.globals.maxSize=500000 * 1024^2,   # 500G (1000 * 1024^2 = 1G)
+        mc.cores=ncpus,
+        MulticoreParam=quote(MulticoreParam(workers=ncpus)),
+        future.rng.onMisuse="ignore")
+
+# Parallelize the run
+plan("multicore", workers=ncpus)
+
+register(MulticoreParam(workers=ncpus))
+```
+
+# Overview
+
+This document details the QC stages of scRNA-seq analysis and runs PCA and UMAP on 
+both the integrated and non-integrated data after SCTransform normalization.
+
+The final SeuratObject is saved at the end, which can be loaded into downstream 
+clustering and marker gene identification analyses, which happen in other documents.
+This lets us prepare the data just once here and then try out multiple parameters 
+downstream independently.
+
+```{r config, cache=TRUE}
+
+# ------------------------------------------------------------------------------
+# User configuration:
+# - input/output files and directories
+# - user variables
+# ------------------------------------------------------------------------------
+
+# Assign file path to sampletable
+sampletable <- '../sampletable.tsv'
+sample_paths <- get_sample_paths(sampletable)
+
+# Assign factor levels
+age.levels <- c(
+    '6w',
+    '10w',
+    '12w',
+    '14w',
+    '18w')
+
+genotype.levels <- c('WT', 'cKO')
+sex.levels <- c('M', 'F')
+
+
+# Assign metric names associated with scDblFinder
+doublet_class <- 'scDblFinder.class'
+doublet_score <- 'scDblFinder.score'
+
+# Set regex patterns to detect mitochondrial/ribosomal genes. This may need to be
+# tweaked based on the species being analyzed.
+#
+# mito_pattern matches 'mt-**', 'Mt_**', 'MT-**', 'mt:**'
+# ribo_pattern matches 'Rps**', 'Rpl**', 'RPS**', 'RPL**', etc
+mito_pattern <- '^mt-|Mt_|MT-|mt:'
+ribo_pattern <- '^R[p|P][s|S]*[l|L]*'
+
+# Set qc metrics to calculate
+qc_metrics <- c('nFeature_RNA', 'nCount_RNA', 'percent.mito')
+
+# Which qc metrics to plot
+plot_metrics <- c('percent.mito', 'percent.ribo',
+                  'nFeature_RNA', 'nCount_RNA')
+
+# Set number of variable features for performing normalization
+variable.features.n <- 3000
+
+# Pick assay to use for integration
+# - 'SCT': normalizes using `SCTransform`
+# - 'RNA': normalizes using `LogNormzlize`
+selected_assay <- 'RNA'
+
+# Decide whether not to run SCTransform v2
+sct.v2 <- TRUE
+
+# Dimension reduction assays
+# By default, this only contains the assay selected above
+dimred_assays <- selected_assay
+
+# Set max number of PCs to calculate. Used in RunPCA()
+pca_dims <- 60
+
+# Set number of UMAP dimensions to calculate. Used in RunUMAP()
+umap_dims <- 40
+
+pref <- 'seurat-v5-qc-lognorm-unsketch'
+
+
+# Create a subdirectory to store BPCells matices 
+bpc.dir <- paste0(pref, '-BPCells')
+if (!dir.exists(bpc.dir)) {
+    # Create a new one if there's no pre-existing directory
+    dir.create(bpc.dir)
+} else {
+    # Remove and create a new one if there's already pre-existing directory
+    # NOTE: this is required due to errors raised by `wirte_matrix_dir`
+    #       when finding a directory with the same name
+    unlink(bpc.dir, recursive=TRUE)
+    dir.create(bpc.dir)
+}
+
+
+# Determine whether you'll run integration on sketched data
+# NOTE: Set to TRUE if your input has more than 2^31-1
+sketch.dataset <- FALSE
+```
+
+# Read data
+
+Data are imported from the output directories created by 10X Genomics’ Cell Ranger 
+into a list of Seurat objects, one per sample.
+
+```{r read_data, cache=TRUE, dependson='config'}
+
+# ------------------------------------------------------------------------------
+# Cellragner-generated `h5` files are imported and saved as BPCells 
+# matrices on disk
+# 
+# See https://satijalab.org/seurat/articles/seurat5_bpcells_interaction_vignette#load-data-from-one-h5-file
+# ------------------------------------------------------------------------------
+
+# Read and create a list of seurat obj
+obj.list <- mclapply(names(sample_paths), function(name) {
+
+    # Create a seurat obj with in-memory dgCMatrix
+    path <- sample_paths[name]
+    sc.data <- Read10X(path)
+    obj <- CreateSeuratObject(sc.data)
+
+    # Write the matrix on-disk
+    # (Overwrites pre-existing matrix!)
+    ondisk.path <- file.path(bpc.dir, name)
+    if (dir.exists(ondisk.path)) {
+        unlink(ondisk.path, recursive=TRUE)
+    }
+    write_matrix_dir(mat=obj[['RNA']]$counts, dir=ondisk.path)
+
+    # Replace the count matrix with on-disk `BPCells` matrix
+    obj.mat <- open_matrix_dir(ondisk.path)
+    obj[['RNA']]$counts <- obj.mat
+
+    # Update the `orig.ident` column in the metadata to samplename
+    obj$orig.ident <- name
+
+    # Add metadata columns and convert each column to `factor if necessary
+    obj@meta.data <- obj@meta.data %>%
+        separate(orig.ident,
+            c('age', 'genotype', 'sex', 'rep'),
+            remove=FALSE) %>%
+        mutate(genotype=factor(genotype, levels=genotype.levels),
+            sex=factor(sex, levels=sex.levels),
+            age=factor(age, levels=age.levels),
+            orig.ident=factor(orig.ident, levels=names(sample_paths))
+        )
+    return(obj)
+    }
+) %>%
+    set_names(names(sample_paths))
+
+```
+
+# QC
+
+This section shows the various calculated QC metrics and thresholds.
+
+
+## Cliff-knee plot {.tabset}
+
+Here we show a plot of UMI counts vs barcodes, also known as the `cliff-knee`
+plot, for each sample.
+
+- The color of the line indicates whether a particular barcode
+  was classified by `cellranger` as coming from an actual cell
+  (`black`) or was part of the background (`gray`).
+- The cells colored in `black` form the starting point of our
+  analysis workflow.
+
+```{r cliff_knee, results='asis', cache=TRUE, dependson='read_data'}
+
+# ------------------------------------------------------------------------------
+# Create Cliss-knee plots
+# ------------------------------------------------------------------------------
+
+p_list <- mclapply(sample_paths, get_cliff_knee) %>%
+    set_names(names(obj.list))
+
+for(s in names(p_list)){
+    mdcat(s, level=3)
+    print(p_list[[s]])
+    cat('\n\n')
+}
+
+```
+
+## Doublet detection
+
+Doublets are detected using the `scDblFinder` package. This finds possible
+doublets missed by Cell Ranger's cliff-knee plots; these will be filtered out.
+
+```{r doubletfinding, dependson='read_data', cache=TRUE}
+
+# -------------------------------------------------------------------------------
+# Use scDblFinder package to identify doublets. This is done on the raw counts,
+# and for each sample separately. We need to temporarily convert to SCE for the
+# purposes of doublet detection. The resulting SeuratObj has additional columns:
+#
+# - scDblFinder.class
+# - scDblFinder.score
+# - scDblFinder.weighted
+# - scDblFinder.cxds_score
+# ------------------------------------------------------------------------------
+
+
+# NOTE:
+# - The `BPCells` matrix is not compatible with `sce`.
+# - We conver the count layer with an on-disk `BPCells` matrix to an in-memory `dgCMatrix`.
+obj.list <- mclapply(names(obj.list), function(name) {
+
+    # Converts on-disk BPCells matrix to in-memory dgCMatrix in each seurat obj
+    x <- obj.list[[name]]
+    counts <- as(object=x[['RNA']]$counts, Class='dgCMatrix')
+    x[['RNA']]$counts <- counts
+
+    # Convert seurat obj to sce obj
+    sce <- as.SingleCellExperiment(x)
+
+    # Compute doublets
+    sce <- scDblFinder(sce)
+
+    # Slice columns created by scDblFinder in the `colData`
+    dbl.df <- colData(sce) %>%
+        as.data.frame() %>%
+        dplyr::select(starts_with('scDblFinder'))
+
+    # Add the new columns to the seurat j
+    x@meta.data <- cbind(x@meta.data, dbl.df)
+
+    # Convert in-memory `dgCMatrix` to on-disk `BPCells` matrix
+    ondisk.path <- file.path(bpc.dir, name)
+    obj.mat <- open_matrix_dir(ondisk.path)
+    x[['RNA']]$counts <- obj.mat
+
+    return(x)
+    }
+) %>%
+    set_names(names(obj.list))
+```
+
+```{r print_doublets}
+data.frame(
+    count=sapply(obj.list, function(x) sum(x$scDblFinder.class=='doublet')),
+    total=sapply(obj.list, function(x) ncol(x))
+) %>%
+    mutate(percent=round(count/total*100, 2)) %>%
+    dplyr::select(-total) %>%
+    knitr::kable()
+```
+
+
+## Quality metrics {.tabset}
+
+Here we use the `scuttle::isOutlier()` function on various metrics. This
+automatically selects a threshold, flagging cells that exceed 3 median absolute
+deviations. This avoids qualitative, *ad hoc* filtering choices, and lets use
+thresholds in a dataset-specific manner.
+
+Note that in cases where the lower value is negative and the metrics only take
+positive values, there will not be a negative threshold.
+
+The table shows the values; the plot shows horizontal lines for each threshold
+for each sample. Only metrics listed in the table (and those that have
+horizontal lines) are used for filtering purposes.
+
+```{r thresholds, results='asis', dependson='doubletfinding', cache=TRUE}
+# ------------------------------------------------------------------------------
+# - Calculate the percentage of mitochondrial and ribosomal gene expression
+# - Update metadata with columns indicating outlier cells to be removed
+# ------------------------------------------------------------------------------
+
+obj.list <- lapply(obj.list,
+    function(x) add_percentage_features(
+        x,
+        mito_pattern=mito_pattern,
+        ribo_pattern=ribo_pattern,
+        mito_label='percent.mito',
+        ribo_label='percent.ribo')
+)
+
+# TODO: add check to see if all percent.mito/percent.ribo == 0
+
+# Use isOutlier() to detect cells with MAD > 3 and store in data.frame `m`.
+
+# NOTE: recall that in purrr parlance, _dfr suffix means "glue together the
+# returned dataframes, row-wise". imap provides both the object and the name
+# (as opposed to just the object for map) which allows us to properly add the
+# orig.id column.
+m <- do.call('rbind',
+    lapply(names(obj.list),
+           function(x) find_thresholds(obj.list[[x]], x, metrics=qc_metrics)
+    )
+)
+
+metrics_df <- purrr::map_dfr(obj.list, function (x) x@meta.data) %>%
+  dplyr::select(all_of(plot_metrics), orig.ident) %>%
+  reshape2::melt()
+
+
+m2 <- m %>%
+    rename(orig.ident=orig.id, variable=metric)
+
+# Apply thresholds based on `m`
+for (ident in unique(m$orig.id)){
+   mdata <- obj.list[[ident]]@meta.data
+
+   mdata$any_outlier <- FALSE
+   for (metric.i in unique(m$metric)){
+     s <- dplyr::filter(m, orig.id==ident, metric==metric.i)
+     above <- mdata[, metric.i] > s$higher
+     mdata[, paste0(metric.i, '_outlier')] <- above
+     mdata$any_outlier <- mdata$any_outlier | above
+   }
+
+   # We also want to remove doublets.
+   mdata$keep <- !(mdata$any_outlier | mdata[, doublet_class ] == 'doublet')
+
+   obj.list[[ident]]@meta.data <- mdata
+}
+```
+
+```{r display_qc_thres, results='asis'}
+
+# ------------------------------------------------------------------------------
+# Clean and display QC results
+# ------------------------------------------------------------------------------
+
+# reformat table of QC metric thresholds
+m_new <- list()
+for(i in 1:nrow(m)){
+    s <- m[i, 'orig.id']
+    tmp <- setNames(m[i, c('lower', 'higher')],
+                    paste0(m[i, 'metric'], '_', c('lower','higher')))
+    if(!s %in% names(m_new)){
+      m_new[[s]] <- tmp
+    } else {
+      m_new[[s]] <- c(m_new[[s]], tmp)
+    }
+}
+
+m_new_df <- as.data.frame(do.call('rbind', m_new))
+m_new_df <- cbind(sample=rownames(m_new_df), m_new_df)
+
+# build sketch to show thresholds
+sketch <- htmltools::withTags(table(
+    class = 'display',
+    thead(
+        tr(
+            th(rowspan=2, 'sample'),
+            lapply(qc_metrics,
+                   function(x) th(class='dt-center', colspan=2, x))
+        ),
+        tr(
+            lapply(rep(c('lower','higher'), length(qc_metrics)), th)
+        )
+    )
+))
+
+# display table using sketch
+
+# NOTE:
+#
+# - columnDefs uses 0-based column indexing
+# - formatSignif uses 1-based column indexing
+mdcat('Table', level=3)
+m_new_df %>%
+    datatable(rownames=FALSE,
+        container=sketch,
+        options=list(
+            columnDefs=list(list(className='dt-center',
+                                 targets=1:(ncol(m_new_df)-1))))
+        ) %>%
+    formatSignif(columns=2:ncol(m_new_df),
+                 digits=4)
+cat('\n\n')
+```
+
+
+```{r qc_metric_plot, results='asis', fig.width=10, fig.height=8}
+
+# ------------------------------------------------------------------------------
+# Plot QC results
+# ------------------------------------------------------------------------------
+
+# plot metric thresholds
+metrics_df <- metrics_df %>%
+    mutate(orig.ident=factor(orig.ident, levels=names(obj.list)))
+mdcat('Plot {.tabset}', level=3)
+for (var in unique(metrics_df$variable)) {
+    mdcat(var, level=4)
+    p <- ggplot(metrics_df %>% dplyr::filter(variable == var)) +
+      aes(y=value, x=orig.ident, fill=orig.ident) +
+      theme(axis.text.x=element_text(angle=90, vjust=0.1, hjust=1)) +
+      geom_violin() +
+      geom_hline(data=m2[m2$variable == var,],
+                 aes(yintercept=higher, color=orig.ident))
+
+    print(p)
+}
+
+
+```
+
+## UpSet plots of filtered cells {.tabset}
+
+Here we show the distribution of cells that were filtered out due to possibly
+multiple metrics.
+
+```{r upset_plot, results='asis'}
+
+# ------------------------------------------------------------------------------
+# Plot outlier cells being unique and intersecting across the QC metrics
+# ------------------------------------------------------------------------------
+
+# UpSet plots of filtered cells
+filtered_matrix <- list()
+for (name in names(obj.list)){
+    mdcat(name, '{.tabset}', level=3)
+    metric_cols <- sapply(qc_metrics, function(x) paste0(x, '_outlier'))
+
+    mdata <- obj.list[[name]]@meta.data
+    filtered_matrix[[name]] <- cbind(
+        mdata[, metric_cols],
+        doublet=mdata[, doublet_class] == 'doublet')
+
+    print(upset(filtered_matrix[[name]] + 0,
+                text.scale=1.5))
+}
+```
+
+## Filtering summary
+
+Here we summarize the number of cells that were filtered out
+based on quality metrics and doublet detection.
+
+```{r filtering_summary}
+# ------------------------------------------------------------------------------
+# Print QC summary table
+# ------------------------------------------------------------------------------
+
+filt <- lapply(names(obj.list), function(x){
+    mdata <- obj.list[[x]]@meta.data
+    raw <- nrow(mdata)
+    ff <- colSums(filtered_matrix[[x]])
+    filtered <- sum(mdata[, 'keep'])
+    c(raw=raw,
+      ff,
+      filtered=filtered,
+      filtered.pct=(raw - filtered)/raw)
+})
+df <- do.call('rbind', filt)
+df <- cbind(sample=names(obj.list), df)
+knitr::kable(df)
+
+```
+
+```{r save_qc}
+qc_list <- list(
+    metadata=lapply(obj.list, function(x) x@meta.data),
+    thresholds=m %>% rename(orig.ident=orig.id))
+saveRDS(qc_list, paste0(pref, '-qc.Rds'))
+```
+
+# Normalization
+
+We perform normalization using either `SCTransform` (aka sctransformation) or `NormalizeData` 
+implementing `LogNormalize` in Seurat v4 (aka log-normalization). Normalization is performed 
+on each dataset independently.
+
+The `SCTransform` function runs in two different versions:
+
+- [v1](https://genomebiology.biomedcentral.com/articles/10.1186/s13059-019-1874-1): v1 
+normalizes raw unique molecular identifier (UMI) counts using negative binomial (NB) 
+generalized linear models (GLM) for each gene as the response variable and sequencing depth
+as the explanatory variable in each dataset. Parameters for the GLM is further learned by 
+accounting for a gene's average expression, which is called _regularized NB regression_.
+- [v2](https://genomebiology.biomedcentral.com/articles/10.1186/s13059-021-02584-9): v2 
+normalizes the counts using the same algorithm as the v1 except that the regularization of
+parameters is performed after excluding genes with very low expression or where variance of
+their molecular counts does not exceed the mean. Such genes violate assumptions of NB distribution
+and better fit Poisson distribution.
+
+In log-normalization, we normalize single cells by dividing feature counts per cell by the total 
+counts for that cell, followed by multiplication with the `scale.factor`, and then transforming 
+to the natural log scale using `log1p`.
+
+
+```{r normalization_option}
+norm_function <- ifelse(
+    selected_assay == 'SCT',
+    'SCT',
+    'LogNormalize'
+)
+
+print(paste0('Normalization using ', norm_function, ' performed...'))
+if (norm_function == 'SCT') {
+    print(
+        paste0("Calling sctransform version ", ifelse(sct.v2, "v2", "v1"), "...")
+        )
+}
+```
+
+
+```{r prep_normalization, dependson='thresholds', cache=TRUE}
+# ------------------------------------------------------------------------------
+# - Remove outlier cells
+# - Merge datasets
+# ------------------------------------------------------------------------------
+
+# Remove outlier cells
+obj.list <- mclapply(obj.list, function(x) subset(x, subset=keep))
+
+if (length(obj.list) > 1) {
+
+    # Merge all datasets
+    obj.merged <- merge(
+        x=obj.list[[1]],
+        y=obj.list[2:length(obj.list)],
+    )
+
+    sct.input <- obj.merged
+
+} else {
+    
+    sct.input <- obj.list[[1]]
+
+}
+```
+
+
+```{r normalize_data, cache=TRUE, dependson='prep_normalization'}
+
+# ------------------------------------------------------------------------------
+# - Normalize counts using `SCTransform`
+#     - If set to 'v2', it causes the model to learn theta and intercept only besides
+#       excluding poisson genes from learning and regularization
+#     - SCTransform() replaces NormalizeData(), ScaleData(), and FindVariableFeatures()
+#     - https://satijalab.org/seurat/articles/sctransform_v2_vignette
+#     - https://satijalab.org/seurat/reference/sctransform
+# - Normalize counts using `NormalizeData` with the `normalization.method` arg 
+#   set to 'LogNormalize'
+# ------------------------------------------------------------------------------
+
+if (selected_assay == 'SCT') {
+
+    # Normalize and find variable features
+    # NOTE: When the `vst.flavor` is set to 'v2', following arguments are
+    # automatically adjusted:
+    # - method = glmGamPoi_offset
+    # - n_cells = 2000,
+    # - exclude_poisson = TRUE 
+    # It causes the model to learn theta and intercept only besides excluding 
+    # poisson genes from learning and regularization
+    # NOTE: When having the object split into multiple layers, `SCTransform` 
+    # runs on each count layer separately
+    obj.merged <- SCTransform(
+        sct.input,
+        vst.flavor=ifelse(sct.v2, 'v2', NULL),
+        verbose=FALSE)
+
+} else if (selected_assay == 'RNA') {
+
+    # Normalize and find variable features
+    obj.merged <- NormalizeData(
+        obj.merged,
+        normalization.method="LogNormalize",
+        verbose=FALSE) %>%
+        # Retrieve N variable features
+        FindVariableFeatures(
+            nfeatures=variable.features.n,
+            verbose=FALSE) %>%
+        ScaleData(verbose=FALSE)
+} else {
+    stop('Invalid normalization method!')
+}
+
+
+# Retrieve N variable features computed by `SCTransform()`
+features <- VariableFeatures(obj.merged)
+
+# Reduce dimensions
+obj.merged <- RunPCA(
+    obj.merged,
+#     assay=selected_assay,
+#     features=features,
+    reduction.name=paste0(tolower(selected_assay), '.pca'),
+    reduction.key=paste0(tolower(selected_assay), 'pca_'),
+    verbose=FALSE,
+    npcs=pca_dims) %>%
+    RunUMAP(
+#        assay=selected_assay,
+       reduction=paste0(tolower(selected_assay), '.pca'),
+       reduction.name=paste0(tolower(selected_assay), '.umap'),
+       reduction.key=paste0(tolower(selected_assay), 'umap_'),
+       verbose=FALSE,
+       dims=1:umap_dims)
+```
+
+
+# Sketching representative cells (optional)
+
+The [sketching](https://www.sciencedirect.com/science/article/pii/S2405471219301528) method 
+enables the integration of large-scale datasets with over 2^31-1 (2,147,483,647) non-zero entries.
+It samples a subset of representative cells using a _leverage score_, which reflects the magnitude
+of its contribution to the gene-covariance matrix. The _leverage score_ is highest for rare
+populations in a dataset. Therefore, the sketched analysis will oversample rare populations,
+thereby retaining the biological complexity of the sample while drastically compressing the dataset.
+
+
+```{r sketch_option}
+# Print
+print(paste("Sketch performed:", sketch.dataset))
+```
+
+```{r sketch, dependson='normalize_data', cache=TRUE}
+# ------------------------------------------------------------------------------
+# - Subset representative cells using `SketchData`
+# - https://satijalab.org/seurat/articles/seurat5_sketch_analysis
+# - https://satijalab.org/seurat/articles/parsebio_sketch_integration
+# - https://satijalab.org/seurat/reference/sketchdata
+# ------------------------------------------------------------------------------
+
+if (sketch.dataset) {
+
+    if (length(obj.list) > 1) {
+        if (selected_assay != 'RNA') {
+            # Preprocess the obj
+            # NOTE: `SketchData` only accepts log-normalized obj
+            DefaultAssay(obj.merged) <- 'RNA'
+            obj.merged <- NormalizeData(
+                obj.merged,
+                normalization.method='LogNormalize',
+                verbose=FALSE) %>%
+                FindVariableFeatures(
+                    verbose=FALSE,
+                    nfeatures=variable.features.n
+                    )
+        }
+
+        # Run sketch
+        obj.merged <- SketchData(
+            obj.merged,
+            verbose=FALSE,
+            sketched.assay='sketch'
+        )
+    } else {
+        print("You have a single dataset. Sketching is skipped.")
+    }
+}
+
+```
+
+
+# Integration
+
+Integration is performed either with or without sketching. Without sketching, data is
+integrated on total cells normalized using `SCTransform` or `LogNormalize`. With sketching,
+integration is performed on a subset of representative cells (called sketched cells) across
+all datasets in a low-dimensional shared space, and the integrated data is then propagated
+back to the full dataset.
+We employ [Canonical Correlation Analysis (CCA)](https://www.cell.com/cell/fulltext/S0092-8674(19)30559-8)
+as the default method for integration.
+
+After integration, sample-specific celltypes should remain separate in the
+resulting UMAP, but there is always a risk of "regressing away" interesting
+biology. So here we run both ways so that we can make an informed decision
+about what to use.
+
+The two versions are split out into two tabs in the below sections. The
+non-integrated version uses the normalized counts computed using either `SCTransform`
+or `LogNormalize` and is labeled "SCT" (for `SCTransform`) or "RNA" (for `LogNormalize`). For
+these tabs, each sample was independently normalized, the data were combined
+back together into a large matrix, and the PCA and UMAPs use that combined
+matrix. In contrast, the "integrated" tabs have PCA and UMAP performed on
+the back-propagated data.
+
+Note that in all cases, differential expression and marker genes should be
+identified using the `SCT` or `RNA` slot, not the `integrated` slot.
+
+We run integration only if we have more than one dataset.
+
+
+```{r print_integration_option}
+print(paste0(
+    "Integration performed on ",
+    ifelse(sketch.dataset, "sketched", "normalized unsketched"),
+    " data ..."))
+```
+
+```{r integration, cache=TRUE, dependson=c('sketch', 'normalize_data')}
+
+# ------------------------------------------------------------------------------
+# Integration is performed in two different cases below:
+# - Integration of sketched data
+# - Integration of sctransformed data
+# - References:
+#     - https://satijalab.org/seurat/articles/parsebio_sketch_integration
+#     - https://satijalab.org/seurat/articles/seurat5_integration
+#     - https://satijalab.org/seurat/articles/integration_introduction
+# -----------------------------------------------------------------------------
+# Run integration
+if (length(obj.list) > 1) {
+
+    # add 'integrated' assay to dimension reduction assays
+    dimred_assays <- c(dimred_assays, 'integrated')
+
+    # Integrate SCT (unsketched) data
+    if (!sketch.dataset) {
+
+        # Integrate datasets
+        obj.integrated <- IntegrateLayers(
+            obj.merged,
+            method=CCAIntegration,
+            orig.reduction=paste0(tolower(selected_assay), '.pca'),
+            assay=selected_assay,
+            new.reduction='integrated.cca',
+            normalization.method=norm_function,
+            verbose=FALSE
+            )
+
+    # Integrate sketched data
+    } else {
+        # Preprocess the sketched obj
+        DefaultAssay(obj.merged) <- 'sketch'
+
+        # Retrieve N variable features computed by `SCTransform()`
+        obj.merged <- FindVariableFeatures(
+            obj.merged,
+            verbose=FALSE,
+            nfeuatures=variable.features.n)
+        features <- VariableFeatures(obj.merged)
+
+        # Scale and reduce dimensions
+        obj.merged <- ScaleData(
+            obj.merged,
+            features=features,
+            verbose=FALSE) %>%
+            RunPCA(
+            assay='sketch',
+            features=features,
+            reduction.name='sketch.pca',
+            reduction.key='sketchpca_',
+            verbose=FALSE) 
+
+        # Integrate layers
+        obj.integrated <- IntegrateLayers(
+            obj.merged,
+            method=CCAIntegration,
+            orig.reduction='sketch.pca',
+            assay="sketch",
+            features=features,
+            new.reduction='integrated.cca',
+            verbose=FALSE
+            )
+
+        # Integrate embeddings from the sketched assay
+        obj.integrated <- ProjectIntegration(
+            obj.integrated,
+            verbose=FALSE,
+            sketched.assay='sketch',
+            method='sketch',
+            assay="RNA",
+            reduction='integrated.cca') %>%
+        # Project high dimensional scRNA expression data from a full dataset
+        # onto the lower dimensional embedding of the sketch of the dataset
+            ProjectData(
+                sketched.assay='sketch',
+                assay='RNA',
+                normalization.method=norm_function,
+                sketched.reduction='integrated.cca.full',
+                full.reduction='integrated.cca.full',
+                verbose=FALSE,
+                dims=1:30
+            )
+
+    }
+
+} else {
+    print("There is only one dataset. It cannot be integrated.")
+    obj.integrated <- obj.list[[1]]
+    # remove 'integrated' from assays
+    dimred_assays <- setdiff(dimred_assays, 'integrated')  
+}
+
+```
+
+
+```{r integrated_dimred, cache=TRUE, dependson='integration'}
+# ------------------------------------------------------------------------------
+# Reduce dimensions on integrated data
+# ------------------------------------------------------------------------------
+
+integrated.reduction <- ifelse(
+    sketch.dataset,
+    'integrated.cca.full',
+    'integrated.cca')
+
+obj.integrated <- RunUMAP(
+    obj.integrated,
+    reduction=integrated.reduction,
+    dims=1:umap_dims,
+    reduction.name='integrated.umap',
+    reduction.key='integratedumap_',
+    verbose=FALSE)
+
+obj.integrated <- RunPCA(
+    obj.integrated,
+    reduction=integrated.reduction,
+    dims=1:pcs_dims,
+    reduction.name='integrated.pca',
+    reduction.key='integratedpca_',
+    verbose=FALSE
+    )
+
+```
+
+```{r save_integrated_obj}
+saveRDS(obj.integrated,
+        file=paste0(pref, '-integrated.rds'),
+        compress=FALSE)
+```
+
+
+## Dimension loadings per gene {.tabset}
+
+The following graphs show the genes that drove the most variance within the first 6 Principal
+Component axes.
+
+```{r dimension_loadings, results='asis', cache=TRUE, dependson='integrated_dimred'}
+for(selected_assay in tolower(dimred_assays)){
+    mdcat(selected_assay, ' {.tabset}', level=3)
+    lst <- list('PCs 1 and 2'=1:2, 'PCs 3 and 4'=3:4, 'PCs 5 and 6'=5:6)
+    for (name in names(lst)){
+        mdcat(name, level=4)
+        print(
+            VizDimLoadings(object=obj.integrated, dims=lst[[name]],
+                           reduction=paste0(selected_assay, '.pca'))
+        )
+    }
+}
+
+```
+
+## Distribution of variance in principal components {.tabset}
+
+A total of 60 dimensions were computed, but only the most statistically
+significant ones should be included to reduce computational burden on the UMAP
+and on any subsequent clustering. The threshold is determined visually from an
+Elbow plot. Here, we chose the first `r pca_dims` at most.
+
+```{r elbowplot, results='asis',  cache=TRUE, dependson='integrated_dimred'}
+
+for(selected_assay in tolower(dimred_assays)){
+    mdcat(selected_assay, ' {.tabset}', level=3)
+    reduction <- paste0(selected_assay, ".pca")
+    n.pcs <- length(obj.integrated[[reduction]]@stdev)
+    ndims <- min(n.pcs, pca_dims)
+    print(
+        ElbowPlot(
+            object=obj.integrated,
+            ndims=ndims,
+            reduction=reduction
+        )
+    )
+}
+
+```
+
+## UMAP plots {.tabset}
+
+Uniform Manifold Approximation and Projection (UMAP) is a manifold learning
+technique for dimension reduction that is run on the Principal Component
+Analysis (PCA). This is a way to look at sample clustering. The x- and y-axes
+do not have units, rather, they represent the dimensions along which the
+samples vary the most. The first two dimensions are plotted in the graph below.
+
+Note that these data are not yet clustered; these integrated and non-integrated
+versions are for assessing whether or not integration was useful for this
+study.
+
+```{r umap, results='asis', cache=TRUE, dependson='integrated_dimred', fig.width=10, fig.height=8}
+
+for (prefix in tolower(dimred_assays)){
+    mdcat(prefix, '{.tabset}', level=3)
+    mdcat('Overlay', level=4)
+    print(DimPlot(object=obj.integrated,
+                  reduction=paste0(prefix, ".umap"),
+                  group.by="orig.ident"))
+    mdcat('Side-by-side', level=4)
+    print(DimPlot(object=obj.integrated,
+                  reduction=paste0(prefix, ".umap"),
+                  split.by="orig.ident"))
+}
+
+```
+
+
+## Feature plots {.tabset}
+
+These UMAP plots show the various metrics calculated in the QC steps above
+on the post-filtered dataset.
+
+```{r feature_plots, results='asis', fig.height=16, fig.width=12, cache=TRUE, dependson='integrated_dimred'}
+
+for (prefix in tolower(dimred_assays)){
+    mdcat(prefix, level=3)
+    print(FeaturePlot(
+        obj.integrated,
+        reduction=paste0(prefix, '.umap'),
+        split.by='orig.ident',
+        features=c(plot_metrics, doublet_score)
+    ))
+}
+
+```
+
+# Session info
+
+```{r session_info, collapse=FALSE}
+sessionInfo()
+```
+
