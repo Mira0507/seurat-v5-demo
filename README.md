@@ -1,8 +1,8 @@
 # seurat-v5-demo
 
-This workflow demonstrates snRNA-seq analysis using Seurat v5,
+This workflow demonstrates scRNA-seq analysis using Seurat v5,
 exploring various combinations for normalization and 
-[sketching](https://www.sciencedirect.com/science/article/pii/S2405471219301528). 
+[sketching](https://www.sciencedirect.com/science/article/pii/S2405471219301528)
 methods. Sketching, introduced in 
 [Seurat v5](https://satijalab.org/seurat/), improves memory efficiency
 when working with large datasets.
