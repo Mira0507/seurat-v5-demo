@@ -7,8 +7,7 @@ methods. Sketching, introduced in
 [Seurat v5](https://satijalab.org/seurat/), improves memory efficiency
 when working with large datasets.
 
-For a more polished workflow, please refer to the following 
-workflow created by myself:
+For a more refined workflow, please refer to the following one developed by me:
 
 - [multiome-wf GitHub](https://github.com/NICHD-BSPC/multiome-wf)
 - [multiome-wf Documentation](https://nichd-bspc.github.io/multiome-wf/)
